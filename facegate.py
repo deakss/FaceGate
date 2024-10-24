@@ -1,6 +1,8 @@
-from PyQt6.QtWidgets import QApplication, QWidget, QLabel, QLineEdit, QPushButton, QVBoxLayout, QHBoxLayout, QStackedLayout, QFileDialog
-import sys, os, json
+from PyQt6.QtWidgets import QApplication, QWidget, QLabel, QLineEdit, QPushButton, QVBoxLayout, QHBoxLayout, QStackedLayout, QFileDialog, QMessageBox
+import sys, os, json, psutil, threading, time
 from proc_block import MainWindow
+from detect_face import encode_faces, detect_faces
+from PyQt6.QtGui import QMovie
 
 class LoginWindow(QWidget):
     def __init__(self):
@@ -14,7 +16,7 @@ class LoginWindow(QWidget):
         self.init_registration_ui()  # Экран регистрации
 
         # Настройка окна
-        self.setWindowTitle('Окно авторизации')
+        self.setWindowTitle('Face Gate')
         self.setGeometry(100, 100, 300, 200)
         self.setLayout(self.stacked_layout)
 
@@ -26,7 +28,6 @@ class LoginWindow(QWidget):
         # Метка для логина
         login_label = QLabel('Username:')
         self.login_input = QLineEdit()
-
         # Метка для пароля
         password_label = QLabel('Password:')
         self.password_input = QLineEdit()
@@ -38,7 +39,7 @@ class LoginWindow(QWidget):
         register_button = QPushButton('Register')
 
         # Макет для кнопок
-        button_layout = QHBoxLayout()
+        button_layout = QVBoxLayout()
         button_layout.addWidget(login_button)
         button_layout.addWidget(gate_id_button)
         button_layout.addWidget(register_button)
@@ -61,11 +62,44 @@ class LoginWindow(QWidget):
         register_button.clicked.connect(self.switch_to_registration)
         login_button.clicked.connect(self.login_user)
 
-    def login_user(self):
-        mainWindow = MainWindow()
-        self.close()
-        mainWindow.show()
+        # Подключаем кнопку GateID к распознаванию лиц
+        gate_id_button.clicked.connect(self.gateid_login_user)
 
+    # Функция логина
+    def login_user(self):
+        try:
+            with open("users.json", "r") as f:
+                users = json.load(f)
+            if users != None:
+                if self.login_input.text() != '' and self.password_input.text() != '' and users[self.login_input.text()] == self.password_input.text():
+                    with open("current_user.json", "w") as f:
+                        json.dump(self.login_input.text(), f)
+                    mainWindow = MainWindow()
+                    self.close()
+                    stop_event.set()
+                    thread.join()
+                    mainWindow.show()
+                else:
+                    print("no same entries")
+            else:
+                print("no entries")
+        except json.decoder.JSONDecodeError:
+            print("err")
+
+    #Функция логина по GateID
+    def gateid_login_user(self):
+        self.stacked_layout.setCurrentIndex(2)
+        encode_faces()
+        name = detect_faces()
+        with open("current_user.json", "w") as f:
+            json.dump(name, f)
+        if name:
+            mainWindow = MainWindow()
+            self.close()
+            stop_event.set()
+            thread.join()
+            mainWindow.show()
+                 
     # Экран регистрации
     def init_registration_ui(self):
         # Лейаут для регистрации
@@ -92,7 +126,7 @@ class LoginWindow(QWidget):
         register_button_reg.clicked.connect(self.register)
 
         # Макет для кнопок
-        button_layout = QHBoxLayout()
+        button_layout = QVBoxLayout()
         button_layout.addWidget(import_profile_button)
         button_layout.addWidget(register_button_reg)
 
@@ -121,17 +155,6 @@ class LoginWindow(QWidget):
         file_name, _ = QFileDialog.getOpenFileName(self, 'Выберите файл профиля', '', 'Profile Files (*.json *.xml)')
         if file_name:
             print(f"Импорт профиля из: {file_name}")
-
-    # Метод для создания лейаута-заглушки
-    def create_placeholder_layout(self):
-        placeholder_layout = QVBoxLayout()
-        placeholder_label = QLabel('Пользователь зарегистрирован. Это заглушка.')
-        placeholder_layout.addWidget(placeholder_label)
-
-        placeholder_widget = QWidget()
-        placeholder_widget.setLayout(placeholder_layout)
-        
-        return placeholder_widget
 
     # Метод для регистрации
     def register(self):
@@ -172,17 +195,49 @@ class LoginWindow(QWidget):
         with open('users.json', 'w') as file:
             json.dump(users, file, indent=4)
 
-        # Получаем виджет с лейаутом-заглушкой
-        placeholder_widget = self.create_placeholder_layout()
+        mainWindow = MainWindow()
+        with open("current_user.json", "w") as f:
+            f.write(self.username_input.text())
+        self.close()
+        mainWindow.show()
+        
+    def load_processes_to_block(self):
+        """Читает список процессов из procs.json"""
+        try:
+            with open('procs.json', 'r') as f:
+                processes_to_block = json.load(f)
+            return processes_to_block
+        except (FileNotFoundError, json.JSONDecodeError):
+            print("Файл procs.json не найден или поврежден.")
+            return []
+        
+    def block_processes(self, processes_to_block):
+        """Завершает процессы с именами, которые есть в списке"""
+        for proc in psutil.process_iter(['name']):
+            try:
+                # Получаем имя процесса
+                proc_name = proc.info['name']
+                # Если процесс есть в списке для блокировки
+                if proc_name in processes_to_block:
+                    print(f"Завершаем процесс: {proc_name} (PID: {proc.pid})")
+                    proc.terminate()  # Посылаем сигнал на завершение
+                    proc.wait(timeout=3)  # Ожидаем завершение процесса
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
 
-        # Добавляем заглушку в стек и устанавливаем ее активной
-        self.stacked_layout.addWidget(placeholder_widget)
-        self.stacked_layout.setCurrentWidget(placeholder_widget)
-
-
+    def infinite_block(self, stop_event):
+        processes_to_block = self.load_processes_to_block()
+        if processes_to_block:
+            # Завершаем процессы
+            while not stop_event.is_set():
+                self.block_processes(processes_to_block)
+                time.sleep(3)
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
     window = LoginWindow()
     window.show()
+    stop_event = threading.Event()
+    thread = threading.Thread(target=window.infinite_block, args=(stop_event,))
+    thread.start()
     sys.exit(app.exec())
